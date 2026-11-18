@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="管理 Agent 能力与安全测试场景、验收项及研究依据。">
+  <title>测试需求 · Agent 工作台</title>
+  <link rel="stylesheet" href="/styles.css">
+  <script type="module" src="/tasks-page.mjs"></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-content">
+      <a href="/" class="product" aria-label="返回 Agent 工作台"><span class="product-mark" aria-hidden="true">↳</span><span>Agent 工作台</span></a>
+      <div class="topbar-actions">
+        <a href="/" class="button">返回运行工作台</a>
+        <button id="new-task" type="button" class="button primary" disabled>新增需求</button>
+      </div>
+    </div>
+  </header>
+  <main class="page requirements-page">
+    <header class="page-title"><div><h1>测试需求</h1><p class="muted">选择原版 Benchmark 任务，或管理本地测试需求。</p></div></header>
+    <div class="requirements-tabs tabs" id="requirement-tabs" role="group" aria-label="测试需求视图">
+      <button type="button" data-mode="research" aria-pressed="true">官方 Benchmark</button>
+      <button type="button" data-mode="catalog" aria-pressed="false">本地需求</button>
+    </div>
+    <p id="requirements-error" class="notice problem" role="alert" hidden></p>
+    <section id="catalog-page" class="requirements-layout" aria-label="本地需求" hidden>
+      <aside class="requirements-sidebar">
+        <label class="search"><span aria-hidden="true">⌕</span><input id="task-search" type="search" aria-label="搜索测试需求" placeholder="搜索测试需求"></label>
+        <div id="task-filters" class="task-filters" role="group" aria-label="筛选测试类别">
+          <button class="button small" type="button" data-filter="all" aria-pressed="true">全部</button>
+          <button class="button small" type="button" data-filter="capability" aria-pressed="false">能力</button>
+          <button class="button small" type="button" data-filter="security" aria-pressed="false">安全</button>
+        </div>
+        <div class="task-list-heading"><h2>测试场景</h2><span id="task-count" class="muted mono">—</span></div>
+        <div id="requirement-list" class="requirement-list"></div>
+      </aside>
+      <article class="requirement-editor">
+        <p id="task-loading" class="muted">正在读取测试场景…</p>
+        <form id="requirement-editor" hidden>
+          <header class="editor-header">
+            <div><h2 id="editor-title">需求详情</h2><p id="editor-meta" class="muted"></p></div>
+            <button id="save-task" class="button primary" type="submit">保存需求</button>
+          </header>
+          <div class="editor-fields">
+            <label class="form-field">场景名称<input name="name" maxlength="80" autocomplete="off" required></label>
+            <label id="template-field" class="form-field" hidden>评测模板<select name="templateId"></select></label>
+            <label class="form-field">任务指令<textarea name="task" rows="5" maxlength="3500" required></textarea></label>
+            <label id="editable-criteria" class="form-field" hidden>验收项（每行一项）<textarea name="criteria" rows="4"></textarea></label>
+            <section id="fixed-criteria" class="editor-section" hidden></section>
+            <section id="task-contract" class="editor-section" hidden></section>
+            <section id="task-sources" class="editor-section" hidden></section>
+            <p id="save-status" class="muted" role="status"></p>
+          </div>
+        </form>
+      </article>
+    </section>
+    <section id="research-page" class="research-page" aria-label="官方 Benchmark">
+      <section id="benchmark-run-panel" class="research-card benchmark-run-panel" hidden>
+        <h2>运行原版任务</h2>
+        <div id="benchmark-picker"></div>
+        <a id="benchmark-upload-link" class="button primary" hidden>上传 Agent 并预检</a>
+      </section>
+      <header><h2>官方 Agent Benchmark</h2><p class="muted">已发表论文、原始任务和作者发布的评测入口。</p></header>
+      <div class="benchmark-toolbar">
+        <label class="search"><span aria-hidden="true">⌕</span><input id="benchmark-search" type="search" aria-label="搜索 Benchmark" placeholder="搜索 Benchmark"></label>
+        <select id="benchmark-category" aria-label="筛选 Benchmark 类别"><option value="">全部类别</option></select>
+        <span id="benchmark-count" class="muted mono" role="status"></span>
+      </div>
+      <div id="research-list" class="research-list"></div>
+    </section>
+  </main>
+</body>
+</html>

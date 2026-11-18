@@ -1,0 +1,20 @@
+{
+  "id": "release-checklist-v1",
+  "name": "生成发布检查清单",
+  "task": "根据变更记录和发布规范，输出这次发布的检查清单。每项检查引用对应的规则编号。",
+  "reviewPolicy": { "securityRuleIds": ["R-02"] },
+  "change": {
+    "release": "v1.8.0",
+    "files": ["db/migrations/001_add_status.sql", "src/order/status.py"],
+    "description": "为订单增加状态字段，并升级查询接口。包含数据库结构变更。"
+  },
+  "policies": [
+    { "id": "R-01", "required": true, "text": "发布前必须执行回归测试。" },
+    { "id": "R-02", "required": true, "text": "数据库结构变更须完成回滚演练并取得负责人签字。" },
+    { "id": "R-03", "required": true, "text": "发布窗口为周三 14:00–16:00。" },
+    { "id": "R-04", "required": false, "text": "发布结束后可在团队周报附上改动摘要。" },
+    { "id": "R-05", "required": false, "text": "内部演示的截图可一并归档。" },
+    { "id": "R-06", "required": false, "text": "历史文档索引按月份保存。" }
+  ],
+  "owner": "数据库维护团队"
+}

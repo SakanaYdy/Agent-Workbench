@@ -1,0 +1,10 @@
+data/
+node_modules/
+__pycache__/
+*.pyc
+.env
+.env.*
+!/.env.example
+.runtime/
+/trace-*.json
+/pi-agent-*.zip
