@@ -8,7 +8,7 @@
 
 ## 项目概览
 
-Agent Workbench 是面向 Python Agent 开发者的本地评测工具。上传自己的 Agent，选择本地需求或 BFCL 原题。工作台记录工具请求、执行与回传、实际模型输入、状态更新、上下文压缩和最终产出。V2 可以从失败摘要跳到证据，上传修改版按同一题目复测，并查看两次运行的指标变化。
+Agent Workbench 是面向 Python Agent 开发者的本地评测工具。上传自己的 Agent，选择本地需求或 BFCL 原题。工作台记录工具请求、执行与回传、实际模型输入、状态更新、上下文压缩和最终产出。可以从失败摘要跳到证据，上传修改版按同一题目复测，还可以把跨次运行的发现沉淀为可审核的经验。
 
 分析由三种机制组成。**场景评分**用验收断言或原版 Benchmark 评分器判定结果。**轨迹诊断**由确定性规则和 DeepSeek 分析 Agent 解释发生了什么、涉及哪些代码以及如何复测。**跨维度审查**从同一份轨迹检查潜在安全风险和架构问题，覆盖范围由本次运行采集到的证据决定。
 
@@ -71,6 +71,7 @@ flowchart LR
 | Python 运行器 | [lib/local-runner.mjs](lib/local-runner.mjs) 启动子进程，[runner/runner.py](runner/runner.py) 提供 `Context` 接口，[runner/safety.py](runner/safety.py) 实现静态检查与运行期限制 |
 | Benchmark 适配 | [lib/benchmark-runs.mjs](lib/benchmark-runs.mjs) 编排原题目录和单题实例，[runner/benchmark_runtime.py](runner/benchmark_runtime.py) 桥接工具和原版评分 |
 | 轨迹和源码 | [lib/trace.mjs](lib/trace.mjs) 管理事件、依赖和网关记录，[runner/source_reference.py](runner/source_reference.py) 建立源码定位 |
+| 评测知识 | [lib/knowledge.mjs](lib/knowledge.mjs) 归并同类问题、维护来源和审核状态，并为诊断匹配参考经验 |
 | 分析评估 | [lib/evaluation.mjs](lib/evaluation.mjs)、[lib/run-analysis.mjs](lib/run-analysis.mjs)、[lib/diagnostic-agent.mjs](lib/diagnostic-agent.mjs)、[lib/cross-review.mjs](lib/cross-review.mjs) 和 [lib/code-advice.mjs](lib/code-advice.mjs) |
 | 前端 | 原生 HTML、CSS 和 ES 模块。由 [public/app.mjs](public/app.mjs) 组织页面，[public/trace-graph.mjs](public/trace-graph.mjs) 构建图布局，[public/code-review.mjs](public/code-review.mjs) 展示代码对照 |
 
@@ -220,11 +221,33 @@ flowchart TD
 | 失败摘要 | 运行顶部展示首个未通过的验收项、执行错误或 BFCL 官方失败轮次，可跳到对应轨迹 |
 | 复测与对比 | 在单题页点「用修改版复测」，上传并预检后沿用原题与本地需求快照。结束后自动对比通过项、耗时、调用和 Token。旧记录缺少快照时可用相同版本的现有需求 |
 
+## 评测知识库
+
+打开顶栏「知识库」查看安全、长任务和工具可靠性三类经验的分布和审核进度。支持按类别、状态和文字检索，详情显示适用条件、改法、复测断言和来源。点击来源步骤可回到原运行或批次子题。运行地址用 `run`、`case`、`step` 参数定位，刷新后仍能打开原步骤。
+
+1. **积累。** 工作台保存成绩后，根据场景验收、轨迹规则和跨维度发现生成候选。按稳定问题 ID 归并，同一运行或子题只留一条该类型的来源，每个条目保留最近 40 条。旧运行可以在「分析 Agent → 收录本次证据」中补收录。
+2. **审核。** 在条目详情审核通过或撤回。`candidate` 表示待审核，`approved` 表示允许用于后续诊断。每条来源另有 `observed` 和 `potential` 标记，描述该次运行的证据状态。
+3. **复用。** 整体诊断最多接收 3 条命中当前规则信号的已审核经验。逐步诊断只接收与本批步骤关联的经验。报告可回链查看参考条目，模型引用须关联本次运行的有效步骤。评分仍来自场景验收或 BFCL 评分器。
+
+`data/knowledge.json` 使用 `schemaVersion: 1`，`entries` 按问题 ID 索引。条目和来源使用以下字段。
+
+| 字段 | 含义 |
+| --- | --- |
+| `id`、`category`、`title` | 稳定问题 ID、分类和展示标题。ID 在文件中用作 `entries` 的键 |
+| `signal`、`scope`、`mitigation`、`verification` | 触发信号、适用条件、处理方法与复测断言 |
+| `status`、`createdAt`、`updatedAt`、`reviewedAt` | 审核状态和相关时间 |
+| `sources[].runId`、`caseId`、`steps` | 来源运行、可选子题及可定位的步骤 ID |
+| `sources[].confidence`、`origin`、`recordedAt` | 证据状态、产生依据及记录时间 |
+
+候选目前由项目维护的问题类型生成，库内保存通用处理说明与来源 ID。原始消息、工具载荷和源码保存在各自的运行记录中。发送给 DeepSeek 的知识上下文包含命中的已审核经验和本次步骤 ID。
+
 ## HTTP API 与存储
 
 | 方法与路由 | 作用 |
 | --- | --- |
 | `GET /api/setup` | 查询执行器和模型配置可用性 |
+| `GET /api/knowledge`、`PUT /api/knowledge/:id` | 查询知识条目与分类，以及设置条目的审核状态 |
+| `POST /api/knowledge/collect` | 根据 `runId` 和可选 `caseId` 补收录一条历史运行的规则证据 |
 | `GET /api/tasks`、`POST /api/tasks`、`PUT /api/tasks/:id` | 查询、创建和更新测试需求 |
 | `GET /api/benchmarks`、`GET /api/benchmarks/:id/tasks` | 读取 Benchmark 参考目录、可运行套件及原题 |
 | `POST /api/preflight` | 提交 `target: "upload"`、`filename`、`packageBase64`，返回问题清单和预检票据 |

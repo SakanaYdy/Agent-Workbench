@@ -1,5 +1,5 @@
 import { element as h, byId, number, elapsed, kindLabel, phaseLabel, raw, collapsible,
-  metric, checkList, findDivergence, firstFailure } from './ui.mjs';
+  metric, checkList, findDivergence, firstFailure, evidenceUrl } from './ui.mjs';
 import { TraceGraph, isIssue } from './trace-graph.mjs';
 import { createTaskPicker } from './task-catalog.mjs';
 import { createBenchmarkPicker } from './benchmark-picker.mjs';
@@ -25,6 +25,7 @@ let retestTarget = null;
 let compareAfterRun = null;
 let stoppingBatch = null;
 let comparisonChoices = new Map();
+let collectingEvidence = false;
 const tasksView = createTaskPicker(request, syncUploadButton);
 const initialParams = new URLSearchParams(location.search);
 const initialBenchmark = initialParams.has('benchmark') ? { suite: initialParams.get('benchmark'),
@@ -368,7 +369,31 @@ function analysisFindings(findings) {
     h('li', {}, h('h4', {}, finding.title), h('p', {}, finding.observation),
       h('dl', {}, h('dt', {}, '建议改动'), h('dd', {}, finding.change),
         h('dt', {}, '如何验证'), h('dd', {}, finding.verify)),
-      h('div', { className: 'analysis-evidence' }, finding.evidence.map(eventLink)))));
+      h('div', { className: 'analysis-evidence' }, finding.evidence.map(eventLink)),
+      finding.knowledgeIds?.length ? h('div', { className: 'analysis-evidence' }, finding.knowledgeIds.map(id => {
+        const entry = state.run.analysis.knowledgeReferences?.find(reference => reference.id === id);
+        return entry ? knowledgeLink(entry) : null;
+      })) : null)));
+}
+
+function knowledgeLink(entry) {
+  return h('a', { className: 'evidence-link', href: '/knowledge?' + new URLSearchParams({ entry: entry.id }) }, entry.title);
+}
+
+async function collectEvidence() {
+  const generation = state.generation;
+  collectingEvidence = true;
+  renderAnalysis();
+  try {
+    const result = await request('/api/knowledge/collect', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(referenceFor(state.run)) });
+    if (state.generation === generation) notify(result.added.length ? '已把本次证据收录到 ' + result.added.length + ' 个知识条目。' : '本次没有可新增的知识来源。');
+  } catch (error) {
+    if (state.generation === generation) notify(error.message, true);
+  } finally {
+    collectingEvidence = false;
+    if (state.view === 'analysis') renderAnalysis();
+  }
 }
 
 const reviewStatus = { observed: '已观察到', potential: '待验证', clear: '已覆盖 · 未发现', uncovered: '未覆盖' };
@@ -402,15 +427,23 @@ function renderAnalysis() {
     return;
   }
   const model = analysis.model;
+  const modelStatus = analysisStatus[state.run.analysisStatus] || (state.setup?.diagnosticEnabled
+    ? '模型分析状态见运行通知。' : '在项目 .env 填写 DEEPSEEK_API_KEY 后可启用模型分析。');
   container.replaceChildren(
+    h('section', { className: 'analysis-knowledge' },
+      h('header', { className: 'knowledge-detail-header' }, h('h3', {}, '评测知识'),
+        h('div', { className: 'run-actions' }, terminalCase(state.run) ? button('收录本次证据', collectEvidence,
+          { className: 'button small', disabled: collectingEvidence }) : null,
+        h('a', { className: 'text-link', href: '/knowledge' }, '查看知识库'))),
+      analysis.knowledgeReferences?.length ? h('div', {}, h('p', { className: 'muted' }, '本次提供给分析 Agent 的已审核经验'),
+        h('div', { className: 'analysis-evidence' }, analysis.knowledgeReferences.map(knowledgeLink))) : null),
     h('section', {}, h('h3', {}, '逐步模型诊断'),
       h('p', { className: 'muted', role: 'status' },
         `${state.run.agentAnalysisCount ?? 0} / ${state.run.events.length} 步已完成模型诊断`,
         state.run.phase === 'diagnosing' ? ' · 分析中' : '')),
     h('section', {},
       h('h3', {}, '整体分析'),
-      h('p', { className: 'muted' }, model ? 'DeepSeek · ' + model.name + ' · 分析耗时 ' + elapsed(state.run.analysisDurationMs) : analysisStatus[state.run.analysisStatus] ||
-        state.setup?.diagnosticEnabled ? '模型分析状态见运行通知。' : '在项目 .env 填写 DEEPSEEK_API_KEY 后可启用模型分析。'),
+      h('p', { className: 'muted' }, model ? 'DeepSeek · ' + model.name + ' · 分析耗时 ' + elapsed(state.run.analysisDurationMs) : modelStatus),
       model ? h('p', { className: 'analysis-summary' }, model.summary) : null,
       model ? analysisFindings(model.findings) : null),
     renderCrossReview(state.run.crossReview),
@@ -526,6 +559,7 @@ function selectStep(id, explicit = false) {
   state.selected = id;
   state.detail = null;
   state.detailTab = '';
+  if (state.run) history.replaceState(null, '', evidenceUrl(state.run.id, state.caseId, id));
   renderTrace();
   renderInspector();
   void loadDetail();
@@ -591,6 +625,7 @@ function selectRun(id, preferred, caseId = null) {
   state.detailGeneration += 1;
   state.run = null;
   state.caseId = caseId;
+  history.replaceState(null, '', evidenceUrl(id, caseId, preferred));
   state.selected = null;
   state.detail = null;
   state.query = '';
@@ -923,7 +958,12 @@ try {
   byId('upload-status').textContent = setup.uploadEnabled
     ? '支持带 run(task, ctx) 入口的可信 .py 或 .zip。安全预检通过后在本机执行。'
     : '当前服务找不到 Python 3.10+。安装 Python 或配置 AGENT_PYTHON 后重启。';
-  if (state.history.length) selectRun(state.history[0].id);
+  const requestedRun = initialParams.get('run');
+  const requestedStep = Number(initialParams.get('step'));
+  if (requestedRun && /^[\da-f]{8}(?:-[\da-f]{4}){3}-[\da-f]{12}$/i.test(requestedRun))
+    selectRun(requestedRun, Number.isSafeInteger(requestedStep) && requestedStep > 0 ? requestedStep : undefined,
+    initialParams.get('case'));
+  else if (state.history.length) selectRun(state.history[0].id);
   if (initialBenchmark) openUpload();
 } catch (error) {
   notify(error.message, true);

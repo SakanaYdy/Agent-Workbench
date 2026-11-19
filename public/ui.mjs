@@ -13,6 +13,12 @@ export function element(tag, attributes, ...children) {
 }
 
 export const byId = id => document.getElementById(id);
+export function evidenceUrl(runId, caseId, step) {
+  const params = new URLSearchParams({ run: runId });
+  if (caseId) params.set('case', caseId);
+  if (step != null) params.set('step', step);
+  return '/?' + params;
+}
 export const number = value => Number.isFinite(value) ? value.toLocaleString('zh-CN') : '—';
 export const elapsed = value => !Number.isFinite(value) ? '—' : value < 1000 ? `${value} ms` : `${(value / 1000).toFixed(2)} s`;
 export const kindLabel = kind => ({

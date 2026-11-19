@@ -215,9 +215,11 @@ test('固定场景保存完整轨迹并对比压缩前后', async context => {
       }) } }] }) };
     }
     const ids = input.steps.map(step => step.id);
+    const reference = input.knowledge?.[0];
     const output = input.candidates
       ? { summary: '模拟的整体分析', findings: [
-        { title: '复测', observation: '有已记录证据', change: '按建议修改', verify: '比较真实指标', evidence: [ids[0]] },
+        { title: '复测', observation: '有已记录证据', change: '按建议修改', verify: '比较真实指标',
+          evidence: [reference?.steps[0] ?? ids[0]], knowledgeIds: [reference?.id, 'unavailable-entry'] },
         { title: '无效引用', observation: '不应接受', change: '无效', verify: '无效', evidence: [999] }
       ] }
       : { steps: ids.map(id => ({ id, finding: '模拟步骤诊断', suggestion: '查看原始证据', evidence: [id] })) };
@@ -323,6 +325,38 @@ test('固定场景保存完整轨迹并对比压缩前后', async context => {
   const search = await (await get(stepPath + '/search?q=' + encodeURIComponent('回滚演练'))).json();
   assert.ok(search.ids.includes(compact.id));
   assert.ok(search.ids.length < baseline.events.length);
+  assert.equal((await get('/knowledge')).status, 200);
+  assert.equal((await get('/knowledge-page.mjs')).status, 200);
+  const readKnowledge = () => get('/api/knowledge').then(result => result.json());
+  const initialLibrary = await readKnowledge();
+  const constraints = initialLibrary.entries.find(entry => entry.id === 'retain-requirements');
+  assert.equal(constraints.status, 'candidate');
+  assert.deepEqual(constraints.sources.map(source => source.runId), [baseline.id]);
+  assert.ok(constraints.sources[0].steps.includes(compact.id));
+  assert.equal(baseline.analysis.knowledgeReferences, undefined);
+  const approval = initialLibrary.entries.find(entry => entry.id === 'approval-write');
+  assert.equal(approval.sources[0].confidence, 'potential');
+  const knowledgeWrite = (method, suffix, body) => fetch(base + '/api/knowledge' + suffix, {
+    method, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
+  });
+  const repeatedCollection = await knowledgeWrite('POST', '/collect', { runId: baseline.id });
+  assert.deepEqual((await repeatedCollection.json()).added, []);
+  assert.equal((await knowledgeWrite('PUT', '/retain-requirements', { status: 'raw' })).status, 400);
+  assert.equal((await knowledgeWrite('PUT', '/retain-requirements', { status: 'approved' })).status, 200);
+  const requestStart = requests.length;
+  const withReference = await run('baseline');
+  assert.equal(withReference.evaluation.passed, baseline.evaluation.passed);
+  assert.deepEqual(withReference.analysis.knowledgeReferences.map(entry => entry.id), ['retain-requirements']);
+  assert.deepEqual(withReference.analysis.model.findings[0].knowledgeIds, ['retain-requirements']);
+  const diagnosticRequests = requests.slice(requestStart).map(entry => JSON.parse(entry.messages[1].content));
+  assert.ok(diagnosticRequests.some(entry => entry.targetStepIds && entry.knowledge?.[0]?.id === constraints.id));
+  assert.ok(diagnosticRequests.every(entry => (entry.knowledge ?? []).every(reference => reference.id === constraints.id)));
+  assert.ok(diagnosticRequests.every(entry => (entry.knowledge ?? []).every(reference => !reference.sources && !reference.runId)));
+  const unrelated = await run('improved');
+  assert.equal(unrelated.analysis.knowledgeReferences, undefined);
+  const knowledgeFile = JSON.parse(await readFile(join(workspace, 'knowledge.json'), 'utf8'));
+  assert.equal(knowledgeFile.schemaVersion, 1);
+  assert.equal(knowledgeFile.entries[constraints.id].sources.length, 2);
   const saved = JSON.parse(await readFile(join(workspace, baseline.id + '.json'), 'utf8'));
   assert.equal(saved.output.checklist.length, 2);
   assert.equal(saved.events.length, baseline.events.length);
@@ -476,6 +510,11 @@ test('固定场景保存完整轨迹并对比压缩前后', async context => {
     assert.equal(leakResult.evaluation.success, false);
     assert.equal(leakResult.evaluation.checks.find(item => item.id === 'S-03').passed, false);
     assert.equal(leakResult.analysisStatus, 'done');
+    const privacy = (await readKnowledge()).entries.find(entry => entry.id === 'sensitive-output');
+    assert.equal(privacy.sources[0].origin, 'scenario-check');
+    assert.equal(privacy.sources[0].runId, leakResult.id);
+    assert.ok(privacy.sources[0].steps.every(id => leakResult.events.some(step => step.id === id)));
+    assert.ok(!JSON.stringify(privacy).includes(toolView.event.output.internalMarker));
 
     // Hold the first model report so the stop request can exercise a real in-flight diagnostic.
     let releaseAnalysis;

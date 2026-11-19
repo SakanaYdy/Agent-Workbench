@@ -16,6 +16,7 @@ import { liveModelConfigured } from './lib/model-gateway.mjs';
 import { createTaskCatalog, describeTask } from './lib/tasks.mjs';
 import { officialBenchmarks } from './lib/benchmarks.mjs';
 import { createBenchmarkRuns } from './lib/benchmark-runs.mjs';
+import { createKnowledge, knowledgeCategories } from './lib/knowledge.mjs';
 
 const base = fileURLToPath(new URL('.', import.meta.url));
 const scenario = JSON.parse(await readFile(join(base, 'shared', 'scenario.json'), 'utf8'));
@@ -31,6 +32,8 @@ const allowedSources = new Map([
   ['/tasks', ['public/tasks.html', 'text/html; charset=utf-8']],
   ['/tasks/', ['public/tasks.html', 'text/html; charset=utf-8']],
   ['/tasks-page.mjs', ['public/tasks-page.mjs', 'text/javascript; charset=utf-8']],
+  ['/knowledge', ['public/knowledge.html', 'text/html; charset=utf-8']],
+  ['/knowledge-page.mjs', ['public/knowledge-page.mjs', 'text/javascript; charset=utf-8']],
   ['/styles.css', ['public/styles.css', 'text/css; charset=utf-8']],
   ['/sample-agent.py', ['examples/agent.py', 'text/x-python; charset=utf-8']]
 ]);
@@ -167,6 +170,7 @@ export async function createWorkbench({ dataDir = join(base, 'data'), analysisCl
   const python = await detectPython();
   const modelAnalysisEnabled = analysisClient?.configured ?? diagnosticConfigured;
   const catalog = await createTaskCatalog(join(dataDir, 'tasks.json'), scenario);
+  const knowledge = createKnowledge(join(dataDir, 'knowledge.json'));
   const benchmarks = createBenchmarkRuns(benchmarkDir, python);
   const tickets = new Map();
   const pendingCodePlans = new Set();
@@ -310,6 +314,14 @@ export async function createWorkbench({ dataDir = join(base, 'data'), analysisCl
   async function diagnoseCase(item, task) {
     const started = performance.now();
     item.analysisStatus = 'running';
+    if (item.events.length) {
+      try {
+        const references = await knowledge.match(item, task);
+        if (references.length) item.analysis.knowledgeReferences = references;
+      } catch (error) {
+        console.error('读取知识库失败', error.message);
+      }
+    }
     await addAgentAnalysis(item, task, analysisClient);
     item.analysisDurationMs += Math.round(performance.now() - started);
     item.analysisStatus = item.diagnosticError ? 'partial' : 'done';
@@ -323,6 +335,14 @@ export async function createWorkbench({ dataDir = join(base, 'data'), analysisCl
 
   function saveRun(run, phase) {
     return writeRecord(join(dataDir, `${run.id}.json`), { ...run, phase });
+  }
+
+  async function collectKnowledge(run, item, task) {
+    try {
+      await knowledge.collect(item, task, { runId: run.id, caseId: run.cases ? item.requirement.id : undefined });
+    } catch (error) {
+      console.error('积累知识失败', error.message);
+    }
   }
 
   async function execute(run, job, tasks) {
@@ -355,6 +375,7 @@ export async function createWorkbench({ dataDir = join(base, 'data'), analysisCl
           item.evaluation ||= evaluate(item, tasks[index]);
         }
         await checkpoint(index, item);
+        await collectKnowledge(run, item, tasks[index]);
       }
       run.phase = 'diagnosing';
       for (let index = 0; index < run.cases.length && !run.stopRequested; index += 1) {
@@ -377,6 +398,7 @@ export async function createWorkbench({ dataDir = join(base, 'data'), analysisCl
     }
     try {
       await saveRun(run, finalPhase);
+      if (!run.cases) await collectKnowledge(run, run, tasks[0]);
       run.phase = finalPhase;
     } catch {
       run.error ||= '运行已结束，保存记录失败。本次记录仅在当前进程中可读。';
@@ -409,6 +431,34 @@ export async function createWorkbench({ dataDir = join(base, 'data'), analysisCl
     }
     if (request.method === 'GET' && path === '/api/tasks') {
       sendJson(response, 200, { tasks: catalog.list(), templates: catalog.templates(), references: catalog.references });
+      return;
+    }
+    if (request.method === 'GET' && path === '/api/knowledge') {
+      sendJson(response, 200, { categories: knowledgeCategories, entries: await knowledge.list() });
+      return;
+    }
+    if (request.method === 'POST' && path === '/api/knowledge/collect') {
+      const { runId, caseId } = await parseBody(request) ?? {};
+      if (typeof runId !== 'string' || !idPattern.test(runId) ||
+          caseId !== undefined && (typeof caseId !== 'string' || !/^[a-z0-9-]{1,100}$/.test(caseId))) {
+        throw httpError(400, '请选择已完成的单题运行');
+      }
+      const run = await loadRun(runId);
+      if (!run) throw httpError(404, '找不到运行记录');
+      const item = await loadCase(locateCase(run, caseId));
+      if (item.cases || !item.evaluation || !['complete', 'failed'].includes(item.phase)) {
+        throw httpError(409, '请选择已完成的单题运行');
+      }
+      const task = item.taskSnapshot;
+      const observed = { ...item, analysis: buildRunAnalysis(item), crossReview: task ? reviewTrajectory(item, task) : buildCrossReview(item) };
+      const added = await knowledge.collect(observed, task, { runId, caseId });
+      sendJson(response, 200, { added: added ?? [] });
+      return;
+    }
+    const knowledgeEntry = path.match(/^\/api\/knowledge\/([a-z-]+)$/);
+    if (request.method === 'PUT' && knowledgeEntry) {
+      const { status } = await parseBody(request) ?? {};
+      sendJson(response, 200, await knowledge.review(knowledgeEntry[1], status));
       return;
     }
     if (request.method === 'GET' && path === '/api/benchmarks') {

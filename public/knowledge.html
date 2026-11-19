@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>评测知识库 · Agent 工作台</title>
+  <link rel="stylesheet" href="/styles.css">
+  <script type="module" src="/knowledge-page.mjs"></script>
+</head>
+<body>
+  <header class="topbar"><div class="topbar-content">
+    <a href="/" class="product"><span class="product-mark" aria-hidden="true">↳</span><span>Agent 工作台</span></a>
+    <div class="topbar-actions"><a href="/" class="button">返回评测</a><a href="/tasks" class="button">测试需求</a></div>
+  </div></header>
+  <main class="page knowledge-page">
+    <header class="page-title"><div><h1>评测知识库</h1><p class="muted">查看评测中积累的经验。审核通过的条目会在后续诊断匹配同类信号时提供给分析 Agent。</p></div></header>
+    <section id="knowledge-overview" class="knowledge-overview" aria-label="知识分类分布"></section>
+    <p id="knowledge-notice" class="notice" role="status">正在读取知识库…</p>
+    <section id="knowledge-browser" class="knowledge-browser" hidden>
+      <aside class="knowledge-sidebar" aria-label="知识条目">
+        <label class="search"><span aria-hidden="true">⌕</span><input id="knowledge-search" type="search" aria-label="搜索经验" placeholder="搜索问题、处理方法或复测条件"></label>
+        <div class="knowledge-filters">
+          <select id="knowledge-category" aria-label="分类"><option value="">全部分类</option></select>
+          <select id="knowledge-status" aria-label="审核状态"><option value="">全部状态</option><option value="candidate">待审核</option><option value="approved">已审核</option></select>
+        </div>
+        <p id="knowledge-count" class="muted" role="status"></p>
+        <div id="knowledge-list" class="knowledge-list"></div>
+      </aside>
+      <article id="knowledge-detail" class="knowledge-detail" aria-label="知识详情"></article>
+    </section>
+  </main>
+</body>
+</html>
