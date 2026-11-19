@@ -35,6 +35,8 @@ const allowedSources = new Map([
   ['/sample-agent.py', ['examples/agent.py', 'text/x-python; charset=utf-8']]
 ]);
 const labels = { baseline: '基线 · 通用摘要', improved: '改进 · 保留强制规则' };
+const activePhases = new Set(['queued', 'running', 'diagnosing']);
+const analysisModes = new Set(['score', 'failed', 'full']);
 
 function packageChecksum(filename, bytes) {
   return createHash('sha256').update(filename).update('\0').update(bytes).digest('hex');
@@ -81,8 +83,17 @@ function validateJob(body) {
       body.taskIds.some(id => typeof id !== 'string') || new Set(body.taskIds).size !== body.taskIds.length)) {
     throw httpError(400, '请选择不同的测试需求');
   }
-  if (body.benchmark && body.taskIds !== undefined) throw httpError(400, '请选择官方 Benchmark 或本地需求');
-  return { target: 'upload', label, filename, packageBase64, benchmark: body.benchmark,
+  if (body.benchmark && body.taskIds !== undefined || body.retestOf && (body.benchmark || body.taskIds !== undefined)) {
+    throw httpError(400, '请选择单一任务来源');
+  }
+  const analysisMode = body.analysisMode ?? 'full';
+  if (!analysisModes.has(analysisMode)) throw httpError(400, '未知的分析范围');
+  const retestOf = body.retestOf;
+  if (retestOf !== undefined && (!retestOf || typeof retestOf.runId !== 'string' || !idPattern.test(retestOf.runId) ||
+      retestOf.caseId !== undefined && (typeof retestOf.caseId !== 'string' || !/^[a-z0-9-]{1,100}$/.test(retestOf.caseId)))) {
+    throw httpError(400, '无效的复测来源');
+  }
+  return { target: 'upload', label, filename, packageBase64, benchmark: body.benchmark, analysisMode, retestOf,
     checksum: packageChecksum(filename, bytes),
     preflightToken: typeof body.preflightToken === 'string' ? body.preflightToken : '',
     taskIds: body.taskIds || [scenario.id] };
@@ -93,7 +104,8 @@ function briefCase(item) {
     revision: item.requirement.revision, phase: item.phase, durationMs: item.durationMs, error: item.error,
     eventCount: item.eventCount ?? item.events.length, passed: item.evaluation?.passed, required: item.evaluation?.required,
     benchmark: item.requirement.benchmark, benchmarkScore: item.evaluation?.benchmark,
-    success: item.evaluation?.success, reviewSummary: item.crossReview?.summary ?? item.reviewSummary };
+    success: item.evaluation?.success, reviewSummary: item.crossReview?.summary ?? item.reviewSummary,
+    analysisStatus: item.analysisStatus };
 }
 
 function buildCrossReview(item, task) {
@@ -116,7 +128,8 @@ function header(run, includeCases = true) {
     agentAnalysisCount: run.agentAnalysisCount ?? 0,
     cases: includeCases ? run.cases?.map(briefCase) : run.cases ? [] : undefined,
     caseCount: run.cases?.length, benchmark: run.benchmark,
-    diagnosticError: run.diagnosticError, preflight: run.preflight, requirement: run.requirement };
+    diagnosticError: run.diagnosticError, preflight: run.preflight, requirement: run.requirement,
+    analysisMode: run.analysisMode, analysisStatus: run.analysisStatus, stopRequested: run.stopRequested, retestOf: run.retestOf };
 }
 
 function evaluateBatch(cases) {
@@ -152,6 +165,7 @@ export async function createWorkbench({ dataDir = join(base, 'data'), analysisCl
   const ongoing = new Map();
   const cached = new Map();
   const python = await detectPython();
+  const modelAnalysisEnabled = analysisClient?.configured ?? diagnosticConfigured;
   const catalog = await createTaskCatalog(join(dataDir, 'tasks.json'), scenario);
   const benchmarks = createBenchmarkRuns(benchmarkDir, python);
   const tickets = new Map();
@@ -207,8 +221,9 @@ export async function createWorkbench({ dataDir = join(base, 'data'), analysisCl
     if (cached.has(id)) return cached.get(id);
     try {
       const run = JSON.parse(await readFile(join(dataDir, `${id}.json`), 'utf8'));
-      if (run.benchmark && ['queued', 'running'].includes(run.phase)) {
-        run.phase = 'failed';
+      if (run.cases && activePhases.has(run.phase)) {
+        run.phase = 'cancelled';
+        for (const item of run.cases) finishInterruptedCase(item);
         run.error = '工作台重启，已结束的题目可继续查看。';
       }
       if (run.evaluation && !run.cases) run.analysis ||= buildRunAnalysis(run);
@@ -218,6 +233,42 @@ export async function createWorkbench({ dataDir = join(base, 'data'), analysisCl
       if (error.code === 'ENOENT') return null;
       throw error;
     }
+  }
+
+  function finishInterruptedCase(item) {
+    if (!activePhases.has(item.phase)) return;
+    item.phase = item.evaluation ? (item.error ? 'failed' : 'complete') : 'cancelled';
+    if (item.analysisStatus === 'pending' || item.analysisStatus === 'running') item.analysisStatus = 'cancelled';
+  }
+
+  function locateCase(run, caseId) {
+    const record = caseId ? run.cases?.find(entry => entry.requirement.id === caseId) : run;
+    if (!record) throw httpError(404, '找不到该批次中的任务');
+    const archive = record.archived ? join(dataDir, run.id, `${record.requirement.id}.json`) : null;
+    return { record, archive };
+  }
+
+  async function loadCase({ record, archive }) {
+    if (!archive) return record;
+    const item = JSON.parse(await readFile(archive, 'utf8'));
+    return { ...item, phase: record.phase, analysisStatus: record.analysisStatus ?? item.analysisStatus };
+  }
+
+  async function selectRetest(reference) {
+    const baseRun = await loadRun(reference.runId);
+    if (!baseRun) throw httpError(404, '找不到原始运行');
+    const source = await loadCase(locateCase(baseRun, reference.caseId));
+    if (!source.requirement || !source.evaluation || !['complete', 'failed'].includes(source.phase)) {
+      throw httpError(409, '请选择已结束且有评估结果的单题记录');
+    }
+    const { requirement } = source;
+    if (requirement.benchmark) {
+      return benchmarks.select({ suite: requirement.benchmark.id, mode: 'task', key: requirement.benchmark.key });
+    }
+    if (source.taskSnapshot) return { tasks: [source.taskSnapshot] };
+    const [current] = catalog.select([requirement.id]);
+    if (current.revision !== requirement.revision) throw httpError(409, '此旧记录缺少当时的需求快照，当前需求版本已变更。');
+    return { tasks: [current] };
   }
 
   async function executeCase(run, job, task) {
@@ -249,10 +300,20 @@ export async function createWorkbench({ dataDir = join(base, 'data'), analysisCl
     run.evaluation = evaluate(run, task);
     run.diagnostics = diagnose(run);
     run.analysis = buildRunAnalysis(run);
-    run.phase = 'diagnosing';
-    await addAgentAnalysis(run, task, analysisClient);
-    run.analysisDurationMs = Math.round(performance.now() - analysisStarted);
     buildCrossReview(run, task);
+    run.analysisDurationMs = Math.round(performance.now() - analysisStarted);
+    const requested = job.analysisMode !== 'score' && (job.analysisMode !== 'failed' || !run.evaluation.success);
+    run.analysisStatus = !requested ? 'skipped' : !modelAnalysisEnabled ? 'unconfigured' : 'pending';
+    run.phase = run.analysisStatus === 'pending' ? 'diagnosing' : run.error ? 'failed' : 'complete';
+  }
+
+  async function diagnoseCase(item, task) {
+    const started = performance.now();
+    item.analysisStatus = 'running';
+    await addAgentAnalysis(item, task, analysisClient);
+    item.analysisDurationMs += Math.round(performance.now() - started);
+    item.analysisStatus = item.diagnosticError ? 'partial' : 'done';
+    item.phase = item.error ? 'failed' : 'complete';
   }
 
   async function writeRecord(file, record) {
@@ -269,35 +330,50 @@ export async function createWorkbench({ dataDir = join(base, 'data'), analysisCl
     if (run.cases) {
       run.phase = 'running';
       const caseDir = run.benchmark ? join(dataDir, run.id) : null;
-      if (caseDir) {
-        await mkdir(caseDir);
-        await saveRun(run, 'running');
+      if (caseDir) await mkdir(caseDir);
+      await saveRun(run, run.phase);
+
+      async function checkpoint(index, item) {
+        if (caseDir) {
+          await writeRecord(join(caseDir, `${item.requirement.id}.json`), item);
+          run.cases[index] = { requirement: item.requirement, phase: item.phase, error: item.error,
+            durationMs: item.durationMs, eventCount: item.events.length, evaluation: item.evaluation,
+            reviewSummary: item.crossReview?.summary, analysisStatus: item.analysisStatus, archived: true };
+        }
+        run.evaluation = evaluateBatch(run.cases);
+        if (caseDir) run.evaluation.benchmark = benchmarkSummary(run.cases);
+        await saveRun(run, run.phase);
       }
+
       for (const [index, item] of run.cases.entries()) {
+        if (run.stopRequested) break;
         try {
           await executeCase(item, job, tasks[index]);
         } catch (error) {
           item.error = error.message.slice(0, 600);
+          item.phase = 'failed';
           item.evaluation ||= evaluate(item, tasks[index]);
         }
-        item.phase = item.error ? 'failed' : 'complete';
-        if (caseDir) {
-          await writeFile(join(caseDir, `${item.requirement.id}.json`), JSON.stringify(item), 'utf8');
-          run.cases[index] = { requirement: item.requirement, phase: item.phase, error: item.error,
-            durationMs: item.durationMs, eventCount: item.events.length, evaluation: item.evaluation,
-            reviewSummary: item.crossReview?.summary, archived: true };
-        }
-        run.evaluation = evaluateBatch(run.cases);
-        if (caseDir) {
-          run.evaluation.benchmark = benchmarkSummary(run.cases);
-          await saveRun(run, 'running');
-        }
+        await checkpoint(index, item);
       }
+      run.phase = 'diagnosing';
+      for (let index = 0; index < run.cases.length && !run.stopRequested; index += 1) {
+        const record = run.cases[index];
+        if (record.analysisStatus !== 'pending') continue;
+        const item = await loadCase(locateCase(run, record.requirement.id));
+        if (run.stopRequested) break;
+        record.analysisStatus = 'running';
+        await diagnoseCase(item, tasks[index]);
+        await checkpoint(index, item);
+      }
+      if (run.stopRequested) run.cases.forEach(finishInterruptedCase);
       run.durationMs = run.cases.reduce((sum, item) => sum + (item.durationMs || 0), 0);
-      finalPhase = 'complete';
+      finalPhase = run.stopRequested ? 'cancelled' : 'complete';
     } else {
       await executeCase(run, job, tasks[0]);
-      finalPhase = run.error ? 'failed' : 'complete';
+      if (run.analysisStatus === 'pending') await diagnoseCase(run, tasks[0]);
+      finalPhase = run.phase;
+      run.phase = 'diagnosing';
     }
     try {
       await saveRun(run, finalPhase);
@@ -327,7 +403,7 @@ export async function createWorkbench({ dataDir = join(base, 'data'), analysisCl
     }
     if (request.method === 'GET' && path === '/api/setup') {
       sendJson(response, 200, { scenario: { id: scenario.id, name: scenario.name, task: scenario.task },
-        uploadEnabled: Boolean(python), diagnosticEnabled: analysisClient?.configured ?? diagnosticConfigured,
+        uploadEnabled: Boolean(python), diagnosticEnabled: modelAnalysisEnabled,
         liveModelEnabled: liveModelConfigured, maxPackageBytes: 512_000 });
       return;
     }
@@ -387,7 +463,7 @@ export async function createWorkbench({ dataDir = join(base, 'data'), analysisCl
         }
         preflight = { checkedAt: ticket.checkedAt, files: ticket.files, checksum: ticket.checksum, filename: job.filename };
       }
-      const selection = job.benchmark ? await benchmarks.select(job.benchmark) : null;
+      const selection = job.retestOf ? await selectRetest(job.retestOf) : job.benchmark ? await benchmarks.select(job.benchmark) : null;
       const tasks = selection?.tasks || (job.target === 'upload' ? catalog.select(job.taskIds) : [scenario]);
       if (ticket) await storePackage(job);
       if (ongoing.size >= 2) throw httpError(429, '执行器正忙，请等当前任务完成。');
@@ -395,13 +471,18 @@ export async function createWorkbench({ dataDir = join(base, 'data'), analysisCl
         if (tickets.get(job.preflightToken) !== ticket || ticket.expires <= Date.now()) throw httpError(409, '安全预检已使用或过期');
         tickets.delete(job.preflightToken);
       }
-      const batch = tasks.length > 1 || job.benchmark?.mode === 'suite';
+      const batch = tasks.length > 1 || Boolean(job.benchmark && job.benchmark.mode !== 'task');
       const run = { id: randomUUID(), label: job.label, target: job.target, scenarioId: tasks.length === 1 ? tasks[0].id : undefined,
         phase: 'queued', createdAt: new Date().toISOString(), events: [], diagnostics: {}, preflight,
-        benchmark: selection ? { id: selection.suite.id, name: selection.suite.name, mode: job.benchmark.mode } : undefined };
-      if (!batch && job.target === 'upload') run.requirement = describeTask(tasks[0]);
+        retestOf: job.retestOf, analysisMode: job.analysisMode ?? 'full',
+        benchmark: selection?.suite ? { id: selection.suite.id, name: selection.suite.name, mode: job.benchmark?.mode ?? 'task' } : undefined };
+      if (!batch && job.target === 'upload') {
+        run.requirement = describeTask(tasks[0]);
+        if (!run.benchmark) run.taskSnapshot = tasks[0];
+      }
       if (batch) run.cases = tasks.map(task => ({
-        requirement: describeTask(task), phase: 'queued', events: [], diagnostics: {}
+        requirement: describeTask(task), taskSnapshot: task.benchmark ? undefined : task,
+        phase: 'queued', events: [], diagnostics: {}
       }));
       ongoing.set(run.id, run);
       sendJson(response, 202, header(run, !run.benchmark));
@@ -411,6 +492,17 @@ export async function createWorkbench({ dataDir = join(base, 'data'), analysisCl
         remember(run);
         ongoing.delete(run.id);
       });
+      return;
+    }
+    const stopRoute = path.match(/^\/api\/runs\/([a-f0-9-]+)\/stop$/);
+    if (request.method === 'POST' && stopRoute) {
+      await parseBody(request);
+      const run = ongoing.get(stopRoute[1]);
+      if (!run?.cases || !run.cases.some(item => activePhases.has(item.phase))) {
+        throw httpError(409, '没有可停止的批次');
+      }
+      run.stopRequested = true;
+      sendJson(response, 202, { stopRequested: true });
       return;
     }
     if (request.method === 'GET' && path === '/api/runs') {
@@ -433,15 +525,14 @@ export async function createWorkbench({ dataDir = join(base, 'data'), analysisCl
         return;
       }
       const caseId = url.searchParams.get('case');
-      let item = caseId ? run.cases?.find(entry => entry.requirement.id === caseId) : run;
-      if (!item) throw httpError(404, '找不到该批次中的任务');
-      const archive = item.archived ? join(dataDir, run.id, `${item.requirement.id}.json`) : null;
-      if (archive && !planRoute) item = JSON.parse(await readFile(archive, 'utf8'));
+      const located = locateCase(run, caseId);
+      const { archive } = located;
+      let item = planRoute ? located.record : await loadCase(located);
       if (match[2]) {
         const index = Number(match[3]) - 1;
         let event;
         if (planRoute) {
-          if (!(analysisClient?.configured ?? diagnosticConfigured)) throw httpError(503, '请先配置 DeepSeek 模型分析');
+          if (!modelAnalysisEnabled) throw httpError(503, '请先配置 DeepSeek 模型分析');
           if (!['complete', 'failed'].includes(item.phase) || !archive && ongoing.has(run.id)) {
             throw httpError(409, '运行结束后可生成代码建议');
           }
@@ -449,7 +540,7 @@ export async function createWorkbench({ dataDir = join(base, 'data'), analysisCl
           if (pendingCodePlans.has(lock)) throw httpError(409, '该条运行记录正在生成代码建议');
           pendingCodePlans.add(lock);
           try {
-            if (archive) item = JSON.parse(await readFile(archive, 'utf8'));
+            if (archive) item = await loadCase(located);
             event = item.events[index];
             if (!event) throw httpError(404, '找不到这个步骤');
             buildCrossReview(item);
@@ -481,13 +572,14 @@ export async function createWorkbench({ dataDir = join(base, 'data'), analysisCl
           JSON.stringify(event.output), JSON.stringify(event.detail)].join(' ').toLocaleLowerCase().includes(query)).map(event => event.id);
         sendJson(response, 200, { ids });
       } else if (match[4] === 'export') {
-        response.setHeader('Content-Disposition', `attachment; filename="trace-${run.id.slice(0, 8)}.json"`);
-        sendJson(response, 200, caseId && run.benchmark ? item : run);
+        const suffix = caseId ? '-' + item.requirement.id.replace(/[^a-z0-9-]/gi, '-') : '';
+        response.setHeader('Content-Disposition', `attachment; filename="trace-${run.id.slice(0, 8)}${suffix}.json"`);
+        sendJson(response, 200, caseId ? { ...item, runId: run.id, caseId, analysisMode: run.analysisMode, preflight: run.preflight } : run);
       } else {
         const detail = header(run, !caseId || !run.benchmark);
         if (caseId) Object.assign(detail, briefCase(item), {
           id: run.id, label: item.requirement.name, caseId, batchPhase: run.phase, scenarioId: caseId,
-          evaluation: item.evaluation, requirement: item.requirement, diagnosticError: item.diagnosticError,
+          error: item.error, evaluation: item.evaluation, requirement: item.requirement, diagnosticError: item.diagnosticError,
           agentAnalysisCount: item.agentAnalysisCount ?? 0
         });
         sendJson(response, 200, { ...detail, output: item.output, analysis: item.analysis, crossReview: buildCrossReview(item),

@@ -68,6 +68,14 @@ a.button { display: inline-flex; align-items: center; color: inherit; text-decor
 .badge { display: inline-flex; align-items: center; flex: none; border-radius: 5px; background: var(--accent-soft); color: var(--accent); font-size: 11px; font-weight: 670; padding: 3px 7px; }
 .badge[data-phase="failed"], .badge[data-phase="check-failed"] { background: var(--warning-soft); color: var(--warning); }
 .badge[data-phase="complete"] { background: var(--success-soft); color: var(--success); }
+.run-findings { display: grid; gap: 8px; padding: 12px 20px; border-bottom: 1px solid var(--line); background: var(--warning-soft); }
+.run-findings h3 { font-size: 14px; color: var(--warning); }
+.run-findings p { font-size: 13px; overflow-wrap: anywhere; }
+.run-findings .run-actions { justify-content: flex-start; }
+.run-actions { display: flex; flex-wrap: wrap; gap: 6px 10px; align-items: center; justify-content: flex-end; }
+#analysis-scope { font-size: 12px; margin-top: 6px; }
+.benchmark-selection { min-height: 110px; width: 100%; }
+.benchmark-choice-hint { font-size: 12px; }
 .metrics { display: grid; grid-template-columns: repeat(4, auto); gap: 15px; }
 .metrics > div { padding-left: 13px; border-left: 1px solid var(--line); display: grid; grid-template-columns: auto auto; align-items: baseline; gap: 1px 4px; }
 .metrics dt { grid-column: 1 / -1; font-size: 11px; color: var(--muted); }
@@ -371,6 +379,7 @@ dialog h2 { font-size: 19px; }
 .benchmark-picker-controls { display: grid; grid-template-columns: repeat(auto-fit, minmax(12rem, 1fr)); gap: .75rem; }
 .benchmark-question-picker { display: grid; gap: .6rem; margin: .5rem 0 1rem; }
 .benchmark-question-picker :is(input, select) { width: 100%; min-width: 0; }
+.benchmark-question-picker input[type="checkbox"] { width: auto; }
 .benchmark-preview { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 10rem; overflow: auto; }
 .benchmark-preview:empty { display: none; }
 .benchmark-status { overflow-wrap: anywhere; }

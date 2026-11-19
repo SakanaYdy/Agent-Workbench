@@ -1,5 +1,5 @@
 import { element as h, byId, number, elapsed, kindLabel, phaseLabel, raw, collapsible,
-  metric, checkList, findDivergence } from './ui.mjs';
+  metric, checkList, findDivergence, firstFailure } from './ui.mjs';
 import { TraceGraph, isIssue } from './trace-graph.mjs';
 import { createTaskPicker } from './task-catalog.mjs';
 import { createBenchmarkPicker } from './benchmark-picker.mjs';
@@ -21,21 +21,28 @@ let compareGeneration = 0;
 let uploadGeneration = 0;
 let approval = null;
 let uploadBusy = false;
+let retestTarget = null;
+let compareAfterRun = null;
+let stoppingBatch = null;
+let comparisonChoices = new Map();
 const tasksView = createTaskPicker(request, syncUploadButton);
 const initialParams = new URLSearchParams(location.search);
 const initialBenchmark = initialParams.has('benchmark') ? { suite: initialParams.get('benchmark'),
-  mode: initialParams.get('range'), key: initialParams.get('key') } : null;
+  mode: initialParams.get('range'), key: initialParams.get('key'), group: initialParams.get('group'),
+  keys: initialParams.get('range') === 'selection' ? JSON.parse(sessionStorage.getItem('benchmark-selection') || '[]') : [] } : null;
 let selectedBenchmark;
+let benchmarkCount = 0;
 let benchmarkSuites;
-const benchmarkPicker = createBenchmarkPicker(byId('upload-benchmark-picker'), request, selection => {
+const benchmarkPicker = createBenchmarkPicker(byId('upload-benchmark-picker'), request, (selection, count) => {
   selectedBenchmark = selection;
+  benchmarkCount = count;
   syncUploadButton();
 });
 
 async function request(path, options) {
   const response = await fetch(path, options);
   const body = await response.json();
-  if (!response.ok) throw new Error(body.error || '请求失败');
+  if (!response.ok) throw Object.assign(new Error(body.error || '请求失败'), { status: response.status });
   return body;
 }
 
@@ -46,6 +53,11 @@ function casePath(id, path = '', query = {}) {
   const search = params.toString();
   return runPath(id) + path + (search ? '?' + search : '');
 }
+
+const referenceFor = run => ({ runId: run.id, ...(run.caseId ? { caseId: run.caseId } : {}) });
+const referenceKey = reference => reference.runId + (reference.caseId ? ':' + reference.caseId : '');
+const referencePath = ({ runId, caseId }) => runPath(runId) + (caseId ? '?' + new URLSearchParams({ case: caseId }) : '');
+const terminalCase = run => Boolean(run && (!run.cases || run.caseId) && run.evaluation && ['complete', 'failed'].includes(run.phase));
 
 function notify(message = '', problem = false) {
   const notice = byId('notice');
@@ -82,7 +94,7 @@ function renderHeader(run) {
   }
   const badge = byId('phase');
   const failedCheck = run.phase === 'complete' && run.evaluation?.success === false;
-  badge.textContent = failedCheck ? '评估未通过' : phaseLabel(run.phase);
+  badge.textContent = failedCheck ? '评估未通过' : run.phase === 'complete' && run.evaluation?.success ? '已通过' : phaseLabel(run.phase);
   badge.dataset.phase = failedCheck ? 'check-failed' : run.phase;
   byId('run-meta').textContent = run.id.slice(0, 8) + ' · ' +
     (run.cases && !run.caseId ? run.cases.length + ' 个测试任务' :
@@ -93,7 +105,7 @@ function renderHeader(run) {
     evaluation ? evaluation.passed + ' / ' + evaluation.required : '—';
   byId('metrics').replaceChildren(
     metric(run.benchmark ? '通过题数' : '必需项', ratio),
-    metric('总耗时', elapsed(run.durationMs)),
+    metric('执行耗时', elapsed(run.durationMs)),
     metric('模型 Token', evaluation?.usageReported ? number(evaluation.inputTokens + evaluation.outputTokens) : '—',
       evaluation?.tokensEstimated ? '估算' : ''),
     metric('工具调用', number(evaluation?.toolCalls))
@@ -102,6 +114,27 @@ function renderHeader(run) {
   const exportLink = byId('trace-export');
   exportLink.hidden = activePhases.has(run.phase);
   exportLink.href = casePath(run.id, '/export');
+  exportLink.textContent = run.cases && !run.caseId ? '导出批次' : '导出本题';
+  byId('run-retest').hidden = !terminalCase(run) || !run.requirement || !state.setup?.uploadEnabled;
+  byId('compare-retest').hidden = !terminalCase(run) || !run.retestOf;
+  const stop = byId('stop-batch');
+  stop.hidden = !run.cases || Boolean(run.caseId) || !activePhases.has(run.phase);
+  stop.disabled = Boolean(run.stopRequested) || stoppingBatch === run.id;
+  stop.textContent = stop.disabled ? '正在停止…' : '当前题结束后停止';
+  renderFailure(run);
+}
+
+function renderFailure(run) {
+  const panel = byId('run-findings');
+  const finding = firstFailure(run);
+  panel.hidden = !finding;
+  panel.replaceChildren();
+  if (!finding) return;
+  panel.append(h('h3', {}, finding.title), h('p', {}, finding.observation), h('div', { className: 'run-actions' },
+    finding.event ? button('定位失败步骤', () => jump(finding.event.id), { className: 'button small' }) : null,
+    finding.scoring && finding.scoring.id !== finding.event?.id ? eventLink(finding.scoring.id) : null,
+    button('查看评分', () => changeView('output'), { className: 'text-link' }),
+    button('查看诊断与复测条件', () => changeView('analysis'), { className: 'text-link' })));
 }
 
 function matchingSteps() {
@@ -339,6 +372,8 @@ function analysisFindings(findings) {
 }
 
 const reviewStatus = { observed: '已观察到', potential: '待验证', clear: '已覆盖 · 未发现', uncovered: '未覆盖' };
+const analysisStatus = { pending: '等待模型诊断', running: '正在逐步诊断', skipped: '本次范围仅包含评分和规则检查',
+  unconfigured: '配置 DeepSeek 后可启用模型诊断', cancelled: '模型诊断已停止，评分和规则结果已保留' };
 
 function reviewFindings(findings) {
   return h('ol', { className: 'analysis-list cross-review-list' }, findings.map(finding => h('li', {},
@@ -374,7 +409,7 @@ function renderAnalysis() {
         state.run.phase === 'diagnosing' ? ' · 分析中' : '')),
     h('section', {},
       h('h3', {}, '整体分析'),
-      h('p', { className: 'muted' }, model ? 'DeepSeek · ' + model.name + ' · 分析耗时 ' + elapsed(state.run.analysisDurationMs) :
+      h('p', { className: 'muted' }, model ? 'DeepSeek · ' + model.name + ' · 分析耗时 ' + elapsed(state.run.analysisDurationMs) : analysisStatus[state.run.analysisStatus] ||
         state.setup?.diagnosticEnabled ? '模型分析状态见运行通知。' : '在项目 .env 填写 DEEPSEEK_API_KEY 后可启用模型分析。'),
       model ? h('p', { className: 'analysis-summary' }, model.summary) : null,
       model ? analysisFindings(model.findings) : null),
@@ -407,7 +442,8 @@ function renderBatch() {
   const target = byId('batch-view');
   const run = state.run;
   if (!run?.cases) { target.replaceChildren(); return; }
-  const complete = run.cases.filter(item => !activePhases.has(item.phase)).length;
+  const evaluated = run.cases.filter(item => typeof item.success === 'boolean').length;
+  const cancelled = run.cases.filter(item => item.phase === 'cancelled').length;
   const reviewed = run.cases.map(item => item.reviewSummary).filter(Boolean);
   const reviewTotal = key => reviewed.reduce((sum, item) => sum + item[key], 0);
   const grouped = run.evaluation?.benchmark?.groups || [];
@@ -416,8 +452,9 @@ function renderBatch() {
   const pages = Math.max(1, Math.ceil(visible.length / pageSize));
   state.batchPage = Math.min(state.batchPage, pages - 1);
   const nodes = visible.slice(state.batchPage * pageSize, (state.batchPage + 1) * pageSize).map(item => {
-    const outcome = item.phase === 'complete' ? (item.success ? '通过' : '评估未通过') : phaseLabel(item.phase);
-    const level = item.phase === 'failed' || item.phase === 'complete' && !item.success ? 'problem' :
+    const outcome = !item.error && typeof item.success === 'boolean' ? (item.success ? '通过' : '评估未通过') :
+      item.error ? '执行失败' : phaseLabel(item.phase);
+    const level = item.error || item.success === false ? 'problem' :
       item.success ? 'success' : 'pending';
     return button([
       h('span', { className: 'batch-card-title' }, h('strong', {}, item.name), h('span', { className: 'batch-state', 'data-level': level }, outcome)),
@@ -427,13 +464,15 @@ function renderBatch() {
         Number.isFinite(item.durationMs) ? ' · ' + elapsed(item.durationMs) : ''),
       item.reviewSummary ? h('span', { className: 'batch-card-meta muted' },
         `安全 ${item.reviewSummary.security} · 架构 ${item.reviewSummary.architecture} · 覆盖 ${item.reviewSummary.covered}/${item.reviewSummary.total}`) : null,
+      item.phase === 'diagnosing' || item.analysisStatus === 'cancelled' ? h('span', { className: 'batch-card-meta muted' }, analysisStatus[item.analysisStatus]) : null,
       item.error ? h('span', { className: 'batch-card-error issue' }, item.error) : null
     ], () => selectRun(run.id, undefined, item.id), { className: 'batch-card' });
   });
   const overview = run.evaluation?.benchmark;
   target.replaceChildren(h('div', { className: 'batch-hub' },
     h('h3', {}, run.benchmark?.name || '任务批次'),
-    h('span', { className: 'muted' }, complete + ' / ' + run.cases.length + ' 个任务已结束'),
+    h('span', { className: 'muted', role: 'status' }, evaluated + ' / ' + run.cases.length + ' 个任务已有结果',
+      cancelled ? ' · ' + cancelled + ' 个任务未执行' : ''),
     reviewed.length ? h('span', { className: 'muted' }, `安全发现 ${reviewTotal('security')} · 架构发现 ${reviewTotal('architecture')} · 覆盖 ${reviewTotal('covered')}/${reviewTotal('total')} 条检查`) : null,
     overview ? h('span', { className: 'muted' }, `${overview.passed} 通过 · ${overview.scored} 已评分 · ${overview.errors} 执行错误`) : null),
     grouped.length ? h('div', { className: 'task-filters', role: 'group', 'aria-label': '题目类别' },
@@ -502,9 +541,11 @@ async function refreshRun(id, generation, preferred) {
     if (current.cases && !state.caseId) changeView('batch');
     const phaseChanged = current.phase !== previous?.phase;
     let selected = preferred != null && current.events.find(event => event.id === preferred);
-    if (!selected && !state.explicitSelection && (state.selected == null || (phaseChanged && !activePhases.has(current.phase)))) {
-      selected = current.events.find(event => event.kind === 'compression' && isIssue(event)) ||
+    const failure = firstFailure(current);
+    if (!selected && !state.explicitSelection && (state.selected == null || (phaseChanged && current.evaluation))) {
+      selected = failure?.event || failure?.scoring || current.events.find(event => event.kind === 'compression' && isIssue(event)) ||
         current.events.find(event => event.kind === 'compression') || current.events.at(0);
+      if (failure && selected) state.graphRound = selected.round;
     }
     if (selected && state.selected !== selected.id) {
       if (preferred != null) state.graphRound = selected.round;
@@ -518,6 +559,10 @@ async function refreshRun(id, generation, preferred) {
     if (state.view === 'output') renderOutput();
     if (state.view === 'analysis') renderAnalysis();
     if (state.view === 'requirement') renderRequirement();
+    if (compareAfterRun === id && terminalCase(current)) {
+      compareAfterRun = null;
+      openRetestComparison(current);
+    }
     if (activePhases.has(current.batchPhase ?? current.phase)) {
       state.poll = setTimeout(() => refreshRun(id, generation), current.benchmark && !current.caseId && current.cases ? 1200 : 430);
     }
@@ -526,7 +571,12 @@ async function refreshRun(id, generation, preferred) {
       void loadHistory().catch(error => notify(error.message, true));
     }
   } catch (error) {
-    if (state.generation === generation) notify(error.message, true);
+    if (state.generation === generation) {
+      notify(error.message, true);
+      if (error.status !== 404 && activePhases.has(state.run?.batchPhase ?? state.run?.phase)) {
+        state.poll = setTimeout(() => refreshRun(id, generation, preferred), 1500);
+      }
+    }
   }
 }
 
@@ -560,6 +610,7 @@ async function submitRun(job) {
   const run = await request('/api/runs', {
     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(job)
   });
+  if (job.retestOf) compareAfterRun = run.id;
   state.history = [run, ...state.history];
   renderHistory();
   notify();
@@ -635,10 +686,39 @@ function syncUploadButton() {
   const official = byId('upload-task-source').value === 'benchmark';
   byId('upload-task-options').hidden = official;
   byId('upload-benchmark-picker').hidden = !official;
-  byId('upload-submit').disabled = uploadBusy || !approval || !(official ? selectedBenchmark : tasksView.ids().length);
+  const count = retestTarget ? 1 : official ? benchmarkCount : tasksView.ids().length;
+  const mode = byId('upload-form').elements.analysisMode.value;
+  byId('analysis-field').hidden = !approval;
+  const scope = byId('analysis-scope');
+  scope.hidden = !approval;
+  scope.textContent = count ? `${count} 个任务 · ` + (mode === 'full' ? '为每题生成整体与逐步模型诊断。' :
+    mode === 'failed' ? '仅为未通过和执行失败的题目生成模型诊断。' : '保存评分和规则结果。') : '请选择任务后开始。';
+  if (count && mode !== 'score') scope.append(' 诊断使用 DeepSeek，会发送用于分析的轨迹片段。');
+  if (count && mode === 'score' && !state.setup?.diagnosticEnabled) scope.append(' 配置 DeepSeek 后可使用模型诊断。');
+  byId('upload-submit').disabled = uploadBusy || !approval || !count;
 }
 
 byId('upload-task-source').addEventListener('change', syncUploadButton);
+byId('upload-form').elements.analysisMode.addEventListener('change', syncUploadButton);
+
+function openUpload(run = null) {
+  retestTarget = run ? referenceFor(run) : null;
+  const description = byId('retest-target');
+  const form = byId('upload-form');
+  form.reset();
+  form.elements.analysisMode.value = state.setup?.diagnosticEnabled ? 'full' : 'score';
+  for (const option of form.elements.analysisMode.options) {
+    option.disabled = option.value !== 'score' && !state.setup?.diagnosticEnabled;
+  }
+  selectedBenchmark = null;
+  benchmarkCount = 0;
+  byId('upload-title').textContent = run ? '上传修改版并复测' : '上传 Agent';
+  description.hidden = !run;
+  description.textContent = run ? '复测任务 · ' + run.requirement.name +
+    (run.requirement.revision ? ' v' + run.requirement.revision : '') + '。通过预检后自动比较两次运行。' : '';
+  resetUpload();
+  byId('upload-dialog').showModal();
+}
 
 byId('agent-file').addEventListener('change', resetUpload);
 byId('upload-check').addEventListener('click', async () => {
@@ -666,15 +746,17 @@ byId('upload-check').addEventListener('click', async () => {
         h('li', {}, item.file + (item.line ? ':' + item.line : ''), ' · ', item.message))) :
         h('p', {}, '可运行这次预检对应的文件。'));
     if (result.approved) {
-      approval = { ...job, preflightToken: result.token };
-      const [research] = await Promise.all([benchmarkSuites ? Promise.resolve({ suites: benchmarkSuites }) : request('/api/benchmarks'), tasksView.load()]);
-      if (generation === uploadGeneration) {
+      if (!retestTarget) {
+        const [research] = await Promise.all([benchmarkSuites ? Promise.resolve({ suites: benchmarkSuites }) : request('/api/benchmarks'), tasksView.load()]);
+        if (generation !== uploadGeneration) return;
         benchmarkSuites = research.suites;
         if (initialBenchmark) byId('upload-task-source').value = 'benchmark';
         selectedBenchmark = null;
         benchmarkPicker.setSuites(benchmarkSuites, initialBenchmark);
         tasksView.setApproved(true);
       }
+      approval = { ...job, preflightToken: result.token };
+      syncUploadButton();
     }
   } catch (error) {
     if (generation === uploadGeneration) {
@@ -696,12 +778,14 @@ byId('upload-form').addEventListener('submit', async event => {
     return;
   }
   const official = byId('upload-task-source').value === 'benchmark';
-  const selection = official ? selectedBenchmark && { benchmark: selectedBenchmark } : { taskIds: tasksView.ids() };
+  const selection = retestTarget ? { retestOf: retestTarget } :
+    official ? selectedBenchmark && { benchmark: selectedBenchmark } : { taskIds: tasksView.ids() };
   if (!selection || selection.taskIds?.length === 0 || uploadBusy) return;
   uploadBusy = true;
   syncUploadButton();
   try {
-    await submitRun({ ...verified, label: event.currentTarget.elements.version.value, ...selection });
+    await submitRun({ ...verified, label: event.currentTarget.elements.version.value,
+      analysisMode: event.currentTarget.elements.analysisMode.value, ...selection });
     byId('upload-dialog').close();
     byId('upload-form').reset();
     resetUpload();
@@ -713,12 +797,23 @@ byId('upload-form').addEventListener('submit', async event => {
   }
 });
 
-function comparableMetric(label, left, right) {
-  return h('tr', {}, h('th', { scope: 'row' }, label), h('td', { className: 'tabular' }, left), h('td', { className: 'tabular' }, right));
+function comparableMetric(label, left, right, delta = '—') {
+  return h('tr', {}, h('th', { scope: 'row' }, label), h('td', { className: 'tabular' }, left),
+    h('td', { className: 'tabular' }, right), h('td', { className: 'tabular' }, delta));
 }
 
 function comparableRuns() {
-  return state.history.filter(run => !run.cases && !activePhases.has(run.phase) && run.evaluation);
+  return state.history.filter(terminalCase);
+}
+
+function sameTask(first, second) {
+  return first.scenarioId === second.scenarioId && (first.requirement?.revision ?? 1) === (second.requirement?.revision ?? 1);
+}
+
+function signedDifference(left, right, format = number) {
+  if (!Number.isFinite(left) || !Number.isFinite(right)) return '—';
+  const delta = right - left;
+  return (delta > 0 ? '+' : delta < 0 ? '−' : '') + format(Math.abs(delta));
 }
 
 async function renderComparison() {
@@ -731,53 +826,95 @@ async function renderComparison() {
   }
   target.replaceChildren(h('p', { className: 'empty-note' }, '正在读取版本数据…'));
   try {
-    const [first, second] = await Promise.all([request(runPath(left)), request(runPath(right))]);
+    const firstChoice = comparisonChoices.get(left), secondChoice = comparisonChoices.get(right);
+    if (!firstChoice || !secondChoice) return;
+    const [first, second] = await Promise.all([request(referencePath(firstChoice.reference)), request(referencePath(secondChoice.reference))]);
     if (generation !== compareGeneration) return;
-    if (first.scenarioId !== second.scenarioId || (first.requirement?.revision ?? 1) !== (second.requirement?.revision ?? 1)) {
+    if (!sameTask(first, second)) {
       target.replaceChildren(h('p', { className: 'empty-note' }, '请选择相同需求及版本下的两条运行记录。'));
       return;
     }
     const study = [first, second].map(run => ({
       ...run,
       score: run.evaluation.passed + ' / ' + run.evaluation.required,
-      tokens: run.evaluation.usageReported ? number(run.evaluation.inputTokens + run.evaluation.outputTokens) +
-        (run.evaluation.tokensEstimated ? '（估算）' : '') : '—',
+      tokens: run.evaluation.usageReported ? run.evaluation.inputTokens + run.evaluation.outputTokens : null,
       compact: run.evaluation.lastCompression
     }));
+    const formatTokens = record => number(record.tokens) + (record.evaluation.tokensEstimated ? '（估算）' : '');
+    const comparableTokens = Boolean(first.evaluation.tokensEstimated) === Boolean(second.evaluation.tokensEstimated);
+    const outcome = run => run.error ? '执行失败' : run.evaluation.success ? '通过' : '评估未通过';
     const table = h('table', { className: 'compare-table' },
-      h('thead', {}, h('tr', {}, h('th', { scope: 'col' }, '指标'), h('th', { scope: 'col' }, 'A'), h('th', { scope: 'col' }, 'B'))),
+      h('thead', {}, h('tr', {}, h('th', { scope: 'col' }, '指标'), h('th', { scope: 'col' }, '原运行'),
+        h('th', { scope: 'col' }, '复测运行'), h('th', { scope: 'col' }, '变化'))),
       h('tbody', {},
-        comparableMetric('通过的必需项', study[0].score, study[1].score),
-        comparableMetric('端到端耗时', elapsed(first.durationMs), elapsed(second.durationMs)),
-        comparableMetric('总 Token', study[0].tokens, study[1].tokens),
+        comparableMetric('运行结果', outcome(first), outcome(second)),
+        comparableMetric('通过的必需项', study[0].score, study[1].score, signedDifference(first.evaluation.passed, second.evaluation.passed)),
+        comparableMetric('工具调用', number(first.evaluation.toolCalls), number(second.evaluation.toolCalls),
+          signedDifference(first.evaluation.toolCalls, second.evaluation.toolCalls)),
+        comparableMetric('执行耗时', elapsed(first.durationMs), elapsed(second.durationMs), signedDifference(first.durationMs, second.durationMs, elapsed)),
+        comparableMetric('总 Token', formatTokens(study[0]), formatTokens(study[1]),
+          comparableTokens ? signedDifference(study[0].tokens, study[1].tokens) : '口径不同'),
         comparableMetric('末轮输入 Token', number(first.evaluation.lastModelInputTokens ?? first.events.findLast(event => event.kind === 'model')?.usage?.inputTokens),
           number(second.evaluation.lastModelInputTokens ?? second.events.findLast(event => event.kind === 'model')?.usage?.inputTokens)),
         comparableMetric('压缩后 Token', number(study[0].compact?.afterTokens), number(study[1].compact?.afterTokens))));
-    const divergence = findDivergence(first.events, second.events);
+    const behaviorKinds = new Set(['tool', 'tool_request', 'tool_result', 'compression', 'output']);
+    const behavior = run => run.events.filter(event => behaviorKinds.has(event.kind) || event.status === 'error');
+    const behavioralDifference = findDivergence(behavior(first), behavior(second));
+    const divergence = behavioralDifference || findDivergence(first.events, second.events);
     const actions = [[first, divergence?.left], [second, divergence?.right]].map(([run, step]) =>
       button(run.label + (step ? ' · #' + step.id + ' ' + step.name : ' · 查看轨迹'),
-        () => { byId('compare-dialog').close(); selectRun(run.id, step?.id); }, { className: 'evidence-link' }));
+        () => { byId('compare-dialog').close(); selectRun(run.id, step?.id, run.caseId ?? null); }, { className: 'evidence-link' }));
     target.replaceChildren(table, h('section', { className: 'source-group' },
-      h('h3', {}, divergence ? '首次轨迹差异' : '输入与输出相同'), actions));
+      h('h3', {}, behavioralDifference ? '首个工具、压缩或产出差异' : divergence ? '首次轨迹差异' : '已记录的输入与输出相同'), actions));
   } catch (error) {
     if (generation === compareGeneration) target.replaceChildren(h('p', { className: 'issue' }, error.message));
   }
 }
 
-byId('open-compare').addEventListener('click', () => {
-  const choices = comparableRuns();
-  for (const id of ['compare-a', 'compare-b']) byId(id).replaceChildren(...choices.map(run =>
-    h('option', { value: run.id }, run.label + ' · ' + run.id.slice(0, 8))));
-  byId('compare-a').value = choices[1].id;
-  byId('compare-b').value = choices[0].id;
+function openComparison(left, right, choices) {
+  comparisonChoices = new Map(choices.map(choice => [referenceKey(choice.reference), choice]));
+  for (const id of ['compare-a', 'compare-b']) byId(id).replaceChildren(...[...comparisonChoices].map(([key, choice]) =>
+    h('option', { value: key }, choice.label + ' · ' + choice.reference.runId.slice(0, 8))));
+  byId('compare-a').value = referenceKey(left);
+  byId('compare-b').value = referenceKey(right);
   byId('compare-dialog').showModal();
   void renderComparison();
+}
+
+function openRetestComparison(run) {
+  const original = run.retestOf;
+  const modified = referenceFor(run);
+  openComparison(original, modified, [{ reference: original, label: '原运行 · ' + run.requirement.name },
+    { reference: modified, label: run.label }]);
+}
+
+byId('open-compare').addEventListener('click', () => {
+  const runs = comparableRuns();
+  const pairs = runs.map(run => [run, runs.find(other => other.id !== run.id && sameTask(run, other))]);
+  const [right, left] = pairs.find(([, compatible]) => compatible) || pairs[0];
+  openComparison(referenceFor(left || runs[1]), referenceFor(right), runs.map(run => ({ reference: referenceFor(run), label: run.label })));
 });
 for (const id of ['compare-a', 'compare-b']) byId(id).addEventListener('change', renderComparison);
 for (const close of document.querySelectorAll('[data-close]')) close.addEventListener('click', () => byId(close.dataset.close).close());
-byId('upload-first').addEventListener('click', () => byId('upload-dialog').showModal());
+byId('upload-first').addEventListener('click', () => openUpload());
 byId('run-picker').addEventListener('change', event => { notify(); selectRun(event.target.value); });
-byId('open-upload').addEventListener('click', () => byId('upload-dialog').showModal());
+byId('open-upload').addEventListener('click', () => openUpload());
+byId('run-retest').addEventListener('click', () => openUpload(state.run));
+byId('compare-retest').addEventListener('click', () => openRetestComparison(state.run));
+byId('stop-batch').addEventListener('click', async () => {
+  const id = state.run.id;
+  stoppingBatch = id;
+  renderHeader(state.run);
+  try {
+    await request(runPath(id) + '/stop', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+    if (state.run?.id === id) state.run.stopRequested = true;
+  } catch (error) {
+    if (state.run?.id === id) notify(error.message, true);
+  } finally {
+    stoppingBatch = null;
+    if (state.run?.id === id) renderHeader(state.run);
+  }
+});
 
 try {
   const [setup] = await Promise.all([request('/api/setup'), loadHistory()]);
@@ -787,7 +924,7 @@ try {
     ? '支持带 run(task, ctx) 入口的可信 .py 或 .zip。安全预检通过后在本机执行。'
     : '当前服务找不到 Python 3.10+。安装 Python 或配置 AGENT_PYTHON 后重启。';
   if (state.history.length) selectRun(state.history[0].id);
-  if (initialBenchmark) byId('upload-dialog').showModal();
+  if (initialBenchmark) openUpload();
 } catch (error) {
   notify(error.message, true);
 }

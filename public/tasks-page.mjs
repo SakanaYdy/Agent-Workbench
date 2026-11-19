@@ -9,7 +9,13 @@ let runnableSuites = [];
 const benchmarkPicker = createBenchmarkPicker(byId('benchmark-picker'), request, selected => {
   const link = byId('benchmark-upload-link');
   link.hidden = !selected;
-  if (selected) link.href = '/?' + new URLSearchParams({ benchmark: selected.suite, range: selected.mode, ...(selected.key ? { key: selected.key } : {}) });
+  if (selected) {
+    const params = new URLSearchParams({ benchmark: selected.suite, range: selected.mode });
+    if (selected.key) params.set('key', selected.key);
+    if (selected.group) params.set('group', selected.group);
+    if (selected.keys) sessionStorage.setItem('benchmark-selection', JSON.stringify(selected.keys));
+    link.href = '/?' + params;
+  }
 });
 let benchmarks = [];
 let current = null;

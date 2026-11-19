@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join, resolve, basename } from 'node:path';
 import { test } from 'node:test';
 import { createWorkbench } from '../server.mjs';
-import { findDivergence } from '../public/ui.mjs';
+import { findDivergence, firstFailure } from '../public/ui.mjs';
 import { createDeepSeekClient } from '../lib/deepseek.mjs';
 import { addAgentAnalysis } from '../lib/diagnostic-agent.mjs';
 import { invokeAgentModel } from '../lib/model-gateway.mjs';
@@ -16,6 +16,20 @@ import { diagnose, evaluate } from '../lib/evaluation.mjs';
 import { reviewTrajectory } from '../lib/cross-review.mjs';
 
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+test('失败摘要定位被选中的批次单题及 BFCL 官方失败轮次', () => {
+  const events = [{ id: 1, round: 1, kind: 'compression' },
+    { id: 2, round: 2, name: 'next_turn' }, { id: 3, round: 4, name: 'BFCL 官方评分' }];
+  const run = { events, cases: [], caseId: 'benchmark-case', evaluation: { success: false,
+    benchmark: { passed: false, reason: 'execution_response_mismatch', failedRound: 2 } } };
+  const failure = firstFailure(run);
+  assert.equal(failure.event.id, 2);
+  assert.equal(failure.scoring.id, 3);
+  assert.equal(firstFailure({ ...run, caseId: null }), null);
+  const output = { id: 4, kind: 'output' };
+  assert.equal(firstFailure({ events: [...events, output], evaluation: { success: false,
+    checks: [{ id: 'R-01', text: '保留规则', passed: false }] } }).event, output);
+});
 
 test('任务判定检查实际参数，并用正常任务识别过度拒绝', () => {
   const scenario = presetTasks.find(task => task.id === 'capability-tool-chain-v1');
@@ -174,6 +188,7 @@ test('固定场景保存完整轨迹并对比压缩前后', async context => {
   const parent = resolve(tmpdir());
   const workspace = await mkdtemp(join(parent, 'agent-workbench-test-'));
   const requests = [];
+  let pauseOverall;
   const simulatedDeepSeek = createDeepSeekClient({ apiKey: 'test-only', fetcher: async (url, options) => {
     assert.equal(url, 'https://api.deepseek.com/chat/completions');
     assert.equal(options.redirect, 'error');
@@ -187,6 +202,7 @@ test('固定场景保存完整轨迹并对比压缩前后', async context => {
     }
     assert.equal(body.response_format.type, 'json_object');
     const input = JSON.parse(body.messages[1].content);
+    if (input.candidates && pauseOverall) await pauseOverall;
     if (input.step) {
       assert.equal(input.source.file, 'agent.py');
       assert.equal(input.source.function, 'compact_history');
@@ -406,6 +422,13 @@ test('固定场景保存完整轨迹并对比压缩前后', async context => {
     assert.equal(readTask.output.securityDecision, 'refuse');
     assert.equal(readTask.requirement.revision, 1);
     assert.ok(readTask.requirement.references.some(source => source.id === 'agentdojo'));
+    const exportResponse = await get(batchPath + '/export?case=' + security.id);
+    assert.match(exportResponse.headers.get('content-disposition'), new RegExp(security.id));
+    const exportedCase = await exportResponse.json();
+    assert.equal(exportedCase.caseId, security.id);
+    assert.equal(exportedCase.runId, batch.id);
+    assert.equal(exportedCase.events.length, readTask.events.length);
+    assert.equal(exportedCase.cases, undefined);
     const taskStep = readTask.events.find(event => event.kind === 'tool');
     const toolView = await (await get(batchPath + '/events/' + taskStep.id + '?case=' + security.id)).json();
     assert.ok(toolView.event.output.internalMarker);
@@ -431,14 +454,62 @@ test('固定场景保存完整轨迹并对比压缩前后', async context => {
     assert.equal(earlier.requirement.criteria.length, 3);
     assert.equal(earlier.evaluation.required, 3);
 
+    const retestApproval = await (await preflight(packageBody)).json();
+    const requestsBeforeRetest = requests.length;
+    const retestOf = { runId: batch.id, caseId: custom.id };
+    const retestSubmission = await post({ ...packageBody, preflightToken: retestApproval.token, retestOf, analysisMode: 'score' });
+    assert.equal(retestSubmission.status, 202);
+    const retest = await waitForRun((await retestSubmission.json()).id);
+    assert.deepEqual(retest.retestOf, retestOf);
+    assert.equal(retest.requirement.revision, 1);
+    assert.equal(retest.evaluation.required, 3);
+    assert.equal(retest.analysisStatus, 'skipped');
+    assert.equal(requestsBeforeRetest, requests.length);
+
     const leaks = { ...packageBody, packageBase64: Buffer.from(
       'def run(task, ctx):\n    note, step = ctx.tool("read_test_note")\n    return {"securityDecision": "refuse", "summary": note["internalMarker"]}\n'
     ).toString('base64') };
     const leakApproval = await (await preflight(leaks)).json();
-    const leakSubmission = await post({ ...leaks, preflightToken: leakApproval.token, taskIds: [security.id] });
+    const leakSubmission = await post({ ...leaks, preflightToken: leakApproval.token, taskIds: [security.id], analysisMode: 'failed' });
     assert.equal(leakSubmission.status, 202);
     const leakResult = await waitForRun((await leakSubmission.json()).id);
     assert.equal(leakResult.evaluation.success, false);
     assert.equal(leakResult.evaluation.checks.find(item => item.id === 'S-03').passed, false);
+    assert.equal(leakResult.analysisStatus, 'done');
+
+    // Hold the first model report so the stop request can exercise a real in-flight diagnostic.
+    let releaseAnalysis;
+    pauseOverall = new Promise(resolve => { releaseAnalysis = resolve; });
+    try {
+      const stopApproval = await (await preflight(packageBody)).json();
+      const started = await (await post({ ...packageBody, preflightToken: stopApproval.token,
+        taskIds: ['capability-tool-chain-v1', 'capability-recovery-v1'], analysisMode: 'full' })).json();
+      const stopPath = '/api/runs/' + started.id;
+      let pending;
+      for (let attempt = 0; attempt < 100; attempt += 1) {
+        pending = await (await get(stopPath)).json();
+        if (pending.cases[0].analysisStatus === 'running') break;
+        await wait(25);
+      }
+      assert.equal(pending.cases[0].analysisStatus, 'running');
+      assert.equal(pending.cases[1].analysisStatus, 'pending');
+      assert.ok(pending.cases.every(item => item.success === true));
+      assert.equal((await fetch(base + stopPath + '/stop', { method: 'POST',
+        headers: { 'Content-Type': 'application/json' }, body: '{}' })).status, 202);
+      releaseAnalysis();
+      let stopped;
+      for (let attempt = 0; attempt < 100; attempt += 1) {
+        stopped = await (await get(stopPath)).json();
+        if (stopped.phase === 'cancelled') break;
+        await wait(25);
+      }
+      assert.equal(stopped.phase, 'cancelled');
+      assert.deepEqual(stopped.cases.map(item => item.analysisStatus), ['done', 'cancelled']);
+      assert.ok(stopped.cases.every(item => item.success === true));
+      assert.ok(stopped.cases.every(item => item.phase === 'complete'));
+    } finally {
+      releaseAnalysis();
+      pauseOverall = null;
+    }
   }
 });

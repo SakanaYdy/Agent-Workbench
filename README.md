@@ -8,7 +8,7 @@
 
 ## 项目概览
 
-Agent Workbench 是面向 Python Agent 开发者的本地评测工具。上传自己的 Agent，选择一条测试需求、多条本地需求或一套 Benchmark。工作台记录工具请求、执行与回传、实际模型输入、状态更新、上下文压缩和最终产出。开发者从批次总览下钻到单题和单步，可以沿证据查看行为、源码和改进建议。
+Agent Workbench 是面向 Python Agent 开发者的本地评测工具。上传自己的 Agent，选择本地需求或 BFCL 原题。工作台记录工具请求、执行与回传、实际模型输入、状态更新、上下文压缩和最终产出。V2 可以从失败摘要跳到证据，上传修改版按同一题目复测，并查看两次运行的指标变化。
 
 分析由三种机制组成。**场景评分**用验收断言或原版 Benchmark 评分器判定结果。**轨迹诊断**由确定性规则和 DeepSeek 分析 Agent 解释发生了什么、涉及哪些代码以及如何复测。**跨维度审查**从同一份轨迹检查潜在安全风险和架构问题，覆盖范围由本次运行采集到的证据决定。
 
@@ -80,9 +80,9 @@ flowchart LR
 2. 独立 Python 进程检查入口、语法、导入和受限操作。成功时，服务用文件名、NUL 分隔符和原始字节计算 SHA-256，将结果绑定到一次性预检票据。票据在 10 分钟内有效。
 3. 创建运行时重验票据和文件校验值，保存上传包快照。运行器在导入项目模块前再次检查。每题使用独立的 Python 进程和临时目录，本地单题执行上限为 30 秒，BFCL 为 6 分钟。
 4. Node.js 与执行器用逐行 JSON 传递事件、工具请求、模型请求和最终产出。被测程序的真实模型请求经过主机网关，Key 留在 Node.js 侧。
-5. 多个本地任务或整套 Benchmark 作为一条批次记录串行执行。Benchmark 逐题归档并更新父批次汇总。单题失败会保留已经采集的轨迹，批次继续运行后续用例。
+5. 多个任务作为一条批次记录串行评分，每题完成后保存结果。按选定范围，在评分阶段结束后生成模型诊断。停止批次时，当前评分或诊断结束后停止调度，已完成的评分和规则结果仍可查阅。
 
-运行生命周期使用 `queued`、`running`、`diagnosing`、`complete` 和 `failed`。`complete` 表示已完成处理，测试是否通过由 `evaluation.success` 表示。
+运行生命周期使用 `queued`、`running`、`diagnosing`、`complete`、`failed` 和 `cancelled`。测试是否通过由 `evaluation.success` 表示，模型诊断状态由 `analysisStatus` 表示。
 
 ## 任务与 Benchmark
 
@@ -93,13 +93,15 @@ flowchart LR
 | 发布规范 | 读取变更和规范，输出 `checklist: [{ruleId, action}]`。按必需条款编号与文本验收 |
 | 工具链与失败恢复 | 核对多步工具序列、实际传参、临时失败后的恢复和结构化结果 |
 | 安全测试及对照 | 在模拟场景中检查授权工具、对不可信工具数据的处理、最终产出和审批状态。包含正常公开数据对照，以发现过度拒绝 |
-| BFCL v3 多轮 | 单题或整套原题执行。由原版状态、工具返回、缺参和不可用工具相关检查给出判分 |
+| BFCL v3 多轮 | 支持单题、勾选多题、按类别或整套原题执行。由原版状态、工具返回、缺参和不可用工具相关检查给出判分 |
 
 已接入运行的是 **BFCL v3 多轮**。Base、Miss Function、Miss Parameter、Long Context 和 Composite 共 1,000 道原题，Composite 来自该版本发布包的 `unused_datasets`。平台的整套汇总对应这五个数据类别。其他 Benchmark 的论文、数据和官方实现通过 [Benchmark 参考目录](docs/agent-evaluation-references.md) 查阅。
 
 1. 将 [BFCL 官方源码包 2025.7.9](https://pypi.org/project/bfcl-eval/2025.7.9/#files) 解压到 `data/benchmarks/bfcl`，使 `bfcl_eval/data` 位于该目录下。可用 `BENCHMARK_DATA_DIR` 指定 `benchmarks` 的替代目录。
 2. 给 BFCL 使用的解释器安装 `mpmath==1.3.0`，用于原版 MathAPI。如使用独立虚拟环境，启动前将 `BENCHMARK_BFCL_PYTHON` 指向该环境的 Python。
-3. 上传支持 BFCL 的 Agent。在任务选择器中切到「运行原版任务」，选择原题或整套。首次验证可从 `multi_turn_base_3` 单题开始。
+3. 上传支持 BFCL 的 Agent。在任务选择器中切到「运行原版任务」，选择测试范围和分析范围。首次验证可从 `multi_turn_base_3` 单题开始。
+
+分析范围可选「仅评分和规则检查」「仅诊断未通过和执行失败的题目」「全量逐步诊断」。前两种适合先看通过情况再决定诊断范围。分析范围只控制工作台自动生成的模型诊断，被测 Agent 自己发起的模型请求由其代码决定。
 
 Agent 用 `ctx.scenario["benchmark"]["id"]` 识别契约，调用 `ctx.tool("next_turn")` 取得本轮 `round`、用户 `messages` 和可用 `tools`，按本轮工具定义执行操作。收到 `done=true` 后返回 JSON 字典。工作台把实际工具调用和状态交给评分器。原题参考答案保留在评分端。批次总览可按类别筛选和翻页，点入单题即可查看判分和轨迹。
 
@@ -146,12 +148,10 @@ message, model_step = ctx.live_model(
 ```mermaid
 flowchart TD
     Run["单题执行结束 · 轨迹、产出或错误"] --> Grade["本地验收 / BFCL 原版评分"]
-    Grade --> Rules["逐步规则诊断 + 全局规则建议"]
-    Rules --> Overall["DeepSeek · 整体分析"]
-    Rules --> Steps["DeepSeek · 逐步归因与缺项补齐"]
-    Overall --> Review["确定性跨维度审查"]
-    Steps --> Review
-    Review --> Store["归档报告与可点击证据"]
+    Grade --> Rules["规则诊断、全局规则建议与跨维度审查"]
+    Rules --> Store["公布评分与可点击证据"]
+    Store --> Overall["按范围生成整体分析"]
+    Store --> Steps["按范围生成逐步诊断与补齐缺项"]
     Store --> Code["选定步骤 · 按需生成代码建议"]
     Code --> Recheck["开发者修改源码 · 复跑同一需求版本"]
 ```
@@ -217,7 +217,8 @@ flowchart TD
 | 调用链 | 默认按轮次聚合，按画布宽度折返。打开轮次后显示步骤与跨轮依赖，支持拖动、缩放、小地图、搜索和异常跳转 |
 | 逐步详情 | 先看规则和模型诊断及关联证据，展开「步骤数据」查看压缩差异、来源去向和原始数据 |
 | 代码对照 | 左栏显示原始文件或片段，右栏显示建议代码，下方展开接入位置、约束和复测条件 |
-| 运行对比 | 对照同一场景版本的运行，比较通过项、耗时、调用与 Token，并定位首处轨迹差异 |
+| 失败摘要 | 运行顶部展示首个未通过的验收项、执行错误或 BFCL 官方失败轮次，可跳到对应轨迹 |
+| 复测与对比 | 在单题页点「用修改版复测」，上传并预检后沿用原题与本地需求快照。结束后自动对比通过项、耗时、调用和 Token。旧记录缺少快照时可用相同版本的现有需求 |
 
 ## HTTP API 与存储
 
@@ -227,18 +228,21 @@ flowchart TD
 | `GET /api/tasks`、`POST /api/tasks`、`PUT /api/tasks/:id` | 查询、创建和更新测试需求 |
 | `GET /api/benchmarks`、`GET /api/benchmarks/:id/tasks` | 读取 Benchmark 参考目录、可运行套件及原题 |
 | `POST /api/preflight` | 提交 `target: "upload"`、`filename`、`packageBase64`，返回问题清单和预检票据 |
-| `POST /api/runs` | 提交相同上传包和 `preflightToken`，可附 `taskIds` 或 `benchmark`。创建成功返回 HTTP 202 |
+| `POST /api/runs` | 提交相同上传包和 `preflightToken`，选择 `taskIds`、`benchmark` 或 `retestOf`，并通过 `analysisMode` 控制自动诊断。创建成功返回 HTTP 202 |
+| `POST /api/runs/:id/stop` | 停止批次的后续评分和诊断，保留已完成的结果 |
 | `GET /api/runs`、`GET /api/runs/:id` | 获取运行列表、运行摘要和事件摘要 |
 | `GET /api/runs/:id/events/:eventId` | 获取原始事件、诊断、网关记录、源码定位和改进建议 |
 | `POST /api/runs/:id/events/:eventId/code-plan` | 为已结束的步骤生成并保存代码建议 |
 | `GET /api/runs/:id/source?file=...` | 查询同次运行归档包中的完整 Python 文件 |
 | `GET /api/runs/:id/search?q=...`、`GET /api/runs/:id/export` | 查找匹配步骤和导出 JSON |
 
-批次中可用 `?case=<任务 ID>` 查询事件、详情和单题分析。BFCL 选择体为 `{"suite":"bfcl","mode":"task","key":"multi_turn_base_3"}`，整套用 `{"suite":"bfcl","mode":"suite"}`。写请求使用 `application/json`。
+批次中可用 `?case=<任务 ID>` 查询事件、详情、分析和导出。复测来源用 `retestOf: { runId, caseId }`，独立运行可省略 `caseId`。`analysisMode` 支持 `score`、`failed`、`full`，默认 `full`。请求体使用 `application/json`。
+
+BFCL 选择使用 `suite: "bfcl"`，`mode` 可设为 `task`（带 `key`）、`selection`（带 `keys`）、`group`（带 `group`）或 `suite`。可在原题目录接口查到题号和类别。
 
 - `data/tasks.json` 保存需求定义和版本。
 - `data/<run-id>.json` 保存运行或批次汇总。BFCL 整套的单题记录保存在 `data/<run-id>/<case-id>.json`。
-- `data/packages/` 按校验值归档原始上传包，供运行详情读取源码。整套导出提供批次汇总，BFCL 单题导出包含该题的轨迹和判分。
+- `data/packages/` 按校验值归档原始上传包，供运行详情读取源码。本地批次和 BFCL 子题均支持独立导出，包含该题轨迹、评分与诊断。
 - 进行中的运行由页面轮询，图只加载摘要，选中步骤后读取详细载荷。
 
 ## 测试与复现

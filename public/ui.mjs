@@ -20,7 +20,7 @@ export const kindLabel = kind => ({
   output: '产出', branch: '分支', retry: '重试', tool_request: '工具请求', tool_result: '结果回传'
 })[kind] || kind;
 export const phaseLabel = phase => ({
-  queued: '排队中', running: '运行中', diagnosing: '诊断中', complete: '已完成', failed: '执行失败'
+  queued: '排队中', running: '运行中', diagnosing: '诊断中', complete: '已完成', failed: '执行失败', cancelled: '已停止'
 })[phase] || phase;
 
 export function raw(value) {
@@ -51,5 +51,33 @@ export function findDivergence(first, second) {
     if (!left || !right || left.kind !== right.kind || left.name !== right.name || left.digest !== right.digest ||
         left.status !== right.status) return { left, right };
   }
+  return null;
+}
+
+const scoringReasons = {
+  execution_response_mismatch: '实际工具返回与官方期望不一致',
+  'multi_turn:execution_response_mismatch': '实际工具返回与官方期望不一致',
+  irrelevance_error: '该轮应等待或澄清，但发生了工具调用',
+  'multi_turn:irrelevance_error:decoder_success': '该轮应等待或澄清，但发生了工具调用',
+  'multi_turn:instance_state_mismatch': '最终工具状态与官方期望不一致'
+};
+
+export function firstFailure(run) {
+  if (run.cases && !run.caseId || !run.evaluation || run.evaluation.success) return null;
+  const score = run.evaluation.benchmark;
+  if (score?.passed === false) {
+    const round = score.failedRound;
+    const event = run.events.find(step => step.round === round && step.status === 'error') ||
+      run.events.find(step => step.round === round && step.name === 'next_turn') ||
+      run.events.find(step => step.round === round);
+    const scoring = run.events.find(step => step.name === 'BFCL 官方评分');
+    return { title: (round ? `第 ${round} 轮 · ` : '') + 'BFCL 评分未通过',
+      observation: scoringReasons[score.reason] || score.reason || '查看官方评分与该轮轨迹。', event, scoring };
+  }
+  const error = run.events.find(step => step.status === 'error');
+  const check = run.evaluation.checks?.find(item => !item.passed);
+  if (run.error) return { title: '运行中断', observation: run.error, event: error };
+  if (check) return { title: '验收项未通过 · ' + check.id, observation: check.text,
+    event: run.events.findLast(step => step.kind === 'output') };
   return null;
 }
